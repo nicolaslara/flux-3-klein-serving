@@ -101,32 +101,32 @@ A redeploy with the same code and settings keeps the snapshot; changing either m
 
 ## Measurements
 
-B200, full pipeline, 1024x1024. Warm medians are 32 requests one at a time; the load columns are 128 (Distilled) and 64 (Base) independent arrivals, all succeeded.
+One B200, 1024x1024, prompt expansion included. "Warm" is one request at a time on a running container. "Under load" is a steady stream of independent requests (128 for Distilled, 64 for Base, none failed), so the percentiles include waiting for the container.
 
-| model | warm median | pictures/min at load | p50 / p95 / p99 at load |
+| model | one picture, warm | pictures per minute under load | p50 / p95 / p99 under load |
 |---|---|---|---|
-| Distilled | 1.74 s | 34.85 | 2.02 / 3.04 / 3.18 s |
-| Base | 4.02 s | 11.26 | 4.07 / 4.38 / 4.40 s |
+| Distilled | 1.74 s | 35 | 2.02 / 3.04 / 3.18 s |
+| Base | 4.02 s | 11 | 4.07 / 4.38 / 4.40 s |
 
-Distilled, warm, by request:
+How long one picture takes depends on the request. Distilled, warm, one request at a time:
 
-| request | per picture |
+| request | one picture |
 |---|---|
-| Text, 1024x1024 | 1.7 s |
-| Edit, one reference | 2.5 s |
-| Edit, two references | 3.5 s |
-| Edit, ten references | 16 s |
-| Text, 2048x2048 | 4.7 s |
-| Text, 4096x4096 (`HIGH_RES=1`) | 35 s |
+| Text to image, 1024x1024 | 1.7 s |
+| Edit with one reference image, 1024x1024 output | 2.5 s |
+| Edit with two reference images | 3.5 s |
+| Edit with ten reference images | 16 s |
+| Text to image, 2048x2048 | 4.7 s |
+| Text to image, 4096x4096 (`HIGH_RES=1`) | 35 s |
 
 Cold starts, medians:
 
 | | Distilled | Base |
 |---|---|---|
-| With a snapshot, to the first picture | 33 s | 33 s |
-| Without a snapshot, to ready | 558 s | 460 s |
+| With a snapshot, until the first picture | 33 s | 33 s |
+| Without a snapshot, until the container is ready | 558 s | 460 s |
 
-Other GPUs, measured with the image engine alone (captions supplied, prompt expansion excluded) at 1024x1024 with two requests in flight:
+Other GPUs. These numbers cover the image engine only (captions supplied, so no prompt expansion), 1024x1024, two requests in flight; they compare GPUs rather than describe the full endpoint:
 
 | GPU | Distilled pictures/min | Base pictures/min | kept warm, per hour |
 |---|---|---|---|
