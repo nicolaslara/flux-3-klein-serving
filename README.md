@@ -13,6 +13,8 @@
 
 `app.py` is the deployment (configuration, image build, container start, Modal server), `flux3_api.py` the request handling, `requirements-pup.txt` the upsampler's locked environment.
 
+For more than about 0.5 pictures per second, or several models, [flux-3-klein-shared-upsampler](https://github.com/nicolaslara/flux-3-klein-shared-upsampler) runs the upsampler once for all workers: cold starts of 17 s instead of 33 s and a third less per picture beyond one worker.
+
 ## Quick start
 
 Accept the terms on Hugging Face for the model and the [prompt upsampler](https://huggingface.co/black-forest-labs/flux-3-image-klein-pup), then:
