@@ -8,7 +8,7 @@
 | Per picture, warm | 1.7 s | 4.0 s |
 | Pictures per minute on one B200 | 35 (p95 3.0 s) | 11 (p95 4.4 s) |
 | Cold start with a snapshot, to the first picture | 33 s | 33 s |
-| Cold start without one (first start after a deploy) | 9 min | 8 min |
+| Cold start without one (first start after a deploy) | 4.5 min | 8 min |
 | One B200 kept warm | $6.89 per hour | same |
 
 `app.py` is the deployment (configuration, image build, container start, Modal server), `flux3_api.py` the request handling, `requirements-pup.txt` the upsampler's locked environment.
@@ -26,7 +26,7 @@ uv run modal secret create huggingface HF_TOKEN=hf_...
 uv run modal deploy app.py
 ```
 
-The first deploy builds the image with the weights inside (34 GB). Deploy prints the URL; export it with a proxy auth token from the Modal dashboard (Settings, Proxy Auth Tokens):
+The first deploy builds the image with the weights inside (34 GB); the build ends with a GPU step of about six minutes that starts each engine once and keeps its compiled graphs and kernel caches; with both engines starting at the same time, that takes about four minutes off the first start after a deploy. Deploy prints the URL; export it with a proxy auth token from the Modal dashboard (Settings, Proxy Auth Tokens):
 
 ```
 export URL=https://<workspace>-<environment>--flux3-klein-distilled-server.us-east.modal.direct
@@ -75,7 +75,7 @@ Layouts: end the prompt with a JSON list of boxes, `[y_min, x_min, y_max, x_max]
 
 ## Cold starts and scaling
 
-A container stops 120 s after its last request, and the next request starts one: about half a minute with a snapshot, about nine minutes without one (the first start after a deploy, or on a new kind of worker). To keep a container up:
+A container stops 120 s after its last request, and the next request starts one: about half a minute with a snapshot, about four and a half minutes without one (the first start after a deploy, or on a new kind of worker). To keep a container up:
 
 ```
 uv run modal run app.py --warm 1
@@ -124,7 +124,9 @@ Cold starts, medians:
 | | Distilled | Base |
 |---|---|---|
 | With a snapshot, until the first picture | 33 s | 33 s |
-| Without a snapshot, until the container is ready | 558 s | 460 s |
+| Without a snapshot, until the container is ready | 264 s | 460 s |
+
+Distilled with both engines' caches in the image and the engines started together: 264 s to ready and 267 s to the first picture, against 362 to 394 s and 392 to 442 s with only the image engine's caches, and 493 s and 496 s with the engines started one after the other. The prompt upsampler loads its compiled graph in 17 s against 32 to 46 s of compiling and its profiling run takes 0.4 s against 61 to 69 s, so both engines are ready about 2.5 min after the container starts; the warmup picture and the snapshot capture are the rest. Pictures are byte-identical with and without the image engine's caches (10 of 10 at fixed seeds and captions, text to image and edits) and warm throughput is unchanged (0.67 against 0.70 pictures per second at four in flight); the prompt upsampler's compiled graph was not checked for parity. Base was measured without the caches.
 
 Other GPUs. These numbers cover the image engine only (captions supplied, so no prompt expansion), 1024x1024, two requests in flight; they compare GPUs rather than describe the full endpoint:
 

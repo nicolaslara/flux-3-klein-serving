@@ -46,8 +46,277 @@ SGLANG_REVISION = "586355a83bdf609579b3309d4125620351156bb7"
 REGISTRY = "lmsysorg/sglang@sha256:b4f09a2ccbcfcc262d49600c3cd7f8581a793ea7d104947257b6a95500953b90"
 CHECKPOINT = "/weights/flux-3-image-klein" + ("-base" if MODEL == "base" else "")
 SAMPLING = dict(temperature=0.0, top_p=0.95, top_k=20, min_p=0.0, max_tokens=3584, presence_penalty=1.5)
+ENGINE_ENV = {"SGLANG_FORCE_FUSED_OP_BACKEND": "torch"}
+# Kernel caches the engine fills on its first warmup; the image build runs that warmup once on the
+# deployment's GPU type so every fresh boot reads them instead of compiling.
+CACHE_ENV = {
+    "HF_HUB_OFFLINE": "1",
+    "SGLANG_CACHE_DIT_ENABLED": "false",
+    "TORCHINDUCTOR_CACHE_DIR": "/cache/image/inductor",
+    "TRITON_CACHE_DIR": "/cache/image/triton",
+    "CUDA_CACHE_PATH": "/cache/image/cuda",
+}
+KERNEL_CACHES = ("/cache/image", "/cache/pup", "/root/.cache/sglang")
+PUP_CUDA = "/opt/pup/lib/python3.12/site-packages/nvidia/cu13"
+# The prompt engine's compiled graph is keyed on its configuration, so the build and the server
+# must start it with the same command and environment for the copy in the image to be reused.
+PUP_ENV = {
+    "CUDA_HOME": PUP_CUDA,
+    "LD_LIBRARY_PATH": f"{PUP_CUDA}/lib",
+    "VLLM_HOST_IP": "127.0.0.1",
+    "VLLM_USE_FLASHINFER_SAMPLER": "0",
+    "VLLM_USE_DEEP_GEMM": "0",
+    "VLLM_SERVER_DEV_MODE": "1",
+    "VLLM_CACHE_ROOT": "/cache/pup/vllm",
+    "TORCHINDUCTOR_CACHE_DIR": "/cache/pup/inductor",
+    "TRITON_CACHE_DIR": "/cache/pup/triton",
+    "CUDA_CACHE_PATH": "/cache/pup/cuda",
+}
+BUILD_CAPTION = (
+    "A still life photograph of two blue ceramic mugs on a weathered oak table beside a tall window, "
+    "soft morning light falling across the wood grain and catching the glaze of the mugs, a folded "
+    "linen napkin and a small brass spoon beside them, shallow depth of field, muted warm tones, the "
+    "garden outside blurred into green and gold, quiet and unhurried, shot on medium format film."
+)
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+
+
+def engine_command(model, lora_repo=""):
+    """The image engine's command line; the image build and the worker must start it identically."""
+    return [
+        "sglang",
+        "serve",
+        "--model-path",
+        "/weights/flux-3-image-klein" + ("-base" if model == "base" else ""),
+        "--model-variant",
+        "fp8r",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8001",
+        "--num-gpus",
+        "1",
+        "--attention-backend",
+        "torch_sdpa",
+        "--cpu-offload-components",
+        "none",
+        "--batching-max-size",
+        "1",
+        "--batching-delay-ms",
+        "0",
+        "--output-path",
+        "",
+        "--enable-breakable-cuda-graph",
+        str(model == "distilled").lower(),
+        "--warmup-mode",
+        "server",
+        "--warmup-resolutions",
+        "1024x1024",
+        "--warmup-steps",
+        str(16 if model == "distilled" else 50),
+        "--warmup-sampling-params",
+        json.dumps(
+            {
+                "quality": "lossless" if model == "distilled" else "exact",
+                **({"guidance_scale": 3.5} if model == "base" else {}),
+            }
+        ),
+    ]
+
+
+def prompt_command(gpu_name):
+    """The prompt engine's command line for the assigned GPU."""
+    fraction, kv_bytes = prompt_memory_budget(gpu_name)
+    return [
+        "/opt/pup/bin/vllm",
+        "serve",
+        "/weights/pup",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "9002",
+        "--served-model-name",
+        "pup",
+        "--dtype",
+        "bfloat16",
+        "--tensor-parallel-size",
+        "1",
+        "--enable-prefix-caching",
+        "--generation-config",
+        "vllm",
+        "--max-model-len",
+        "8192",
+        "--max-num-seqs",
+        "16",
+        "--gpu-memory-utilization",
+        fraction,
+        "--kv-cache-memory-bytes",
+        kv_bytes,
+        "--limit-mm-per-prompt",
+        '{"image":10}',
+        "--attention-config",
+        '{"backend":"TRITON_ATTN"}',
+        "--enable-sleep-mode",
+    ]
+
+
+def assigned_gpu_name():
+    return subprocess.check_output(
+        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True
+    ).strip()
+
+
+def wait_for_engine(process, port, timeout, name):
+    import httpx
+
+    deadline = time.monotonic() + timeout
+    with httpx.Client(timeout=5) as client:
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(f"{name} exited; inspect the container logs")
+            try:
+                if client.get(f"http://127.0.0.1:{port}/health").status_code == 200:
+                    return
+            except httpx.TransportError:
+                pass
+            time.sleep(1)
+    raise TimeoutError(f"{name} exceeded the startup deadline")
+
+
+def expand_once(tokenizer, system_prompt, request, timeout):
+    """One completed prompt expansion from the local prompt engine, returned as the caption."""
+    import httpx
+
+    text = tokenizer.apply_chat_template(
+        [{"role": "system", "content": system_prompt}, {"role": "user", "content": request}],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    stop_tokens = [tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")]
+    with httpx.Client(timeout=timeout) as client:
+        expansion = client.post(
+            "http://127.0.0.1:9002/v1/completions",
+            json={
+                "model": "pup",
+                "prompt": tokenizer.encode(text, add_special_tokens=False),
+                **SAMPLING,
+                "stop_token_ids": stop_tokens,
+            },
+        ).raise_for_status()
+    answer = expansion.json()["choices"][0]
+    if answer.get("finish_reason") != "stop" or not answer.get("text", "").strip():
+        raise RuntimeError("Prompt expansion did not complete")
+    return answer["text"].strip()
+
+
+def stop_process(process):
+    if process.poll() is None:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+
+
+def generate_once(parameters, timeout):
+    """One picture from the local engine, checked to be the expected 1024-square JPEG."""
+    import base64
+    import io
+
+    import httpx
+    from PIL import Image
+
+    with httpx.Client(timeout=timeout) as client:
+        generated = client.post(
+            "http://127.0.0.1:8001/v1/images/generations", json=parameters
+        ).raise_for_status()
+    raw = base64.b64decode(generated.json()["data"][0]["b64_json"], validate=True)
+    with Image.open(io.BytesIO(raw)) as output:
+        if output.size != (1024, 1024) or output.format != "JPEG":
+            raise RuntimeError("Generation did not return the expected 1024-square JPEG")
+        output.load()
+    return raw
+
+
+def compile_kernels(model, lora_repo=""):
+    """Start each engine on the build GPU once so its compiled graphs, JIT kernels and autotune tables ship in the image."""
+    from transformers import AutoTokenizer
+
+    started = time.monotonic()
+    started_at = time.time()
+    # The engines run one after the other so the prompt engine's memory profiler sees only itself.
+    process = subprocess.Popen(
+        prompt_command(assigned_gpu_name()),
+        env={**os.environ, **PUP_ENV, "HOME": "/root"},
+        start_new_session=True,
+    )
+    try:
+        wait_for_engine(process, 9002, 1500, "prompt engine")
+        prompt_ready_s = time.monotonic() - started
+        expand_once(
+            AutoTokenizer.from_pretrained("/weights/pup", local_files_only=True),
+            json.loads(Path("/weights/pup/system_prompts.json").read_text())["t2i"],
+            "Two blue mugs on a wooden table by a window",
+            120,
+        )
+    finally:
+        stop_process(process)
+    process = subprocess.Popen(
+        engine_command(model, lora_repo),
+        env={**os.environ, **ENGINE_ENV, "HOME": "/root"},
+        start_new_session=True,
+    )
+    try:
+        wait_for_engine(process, 8001, 1500, "image engine")
+        ready_s = time.monotonic() - started
+        generate_once(
+            {
+                "prompt": BUILD_CAPTION,
+                "seed": 42,
+                "generator_device": "cpu",
+                "num_inference_steps": 16 if model == "distilled" else 50,
+                "quality": "lossless" if model == "distilled" else "exact",
+                "output_format": "jpeg",
+                "response_format": "b64_json",
+                "enable_cache_dit": False,
+                "enhance_prompt": False,
+                "output_compression": 95,
+                "size": "1024x1024",
+                **({"guidance_scale": 3.5} if model == "base" else {}),
+            },
+            900,
+        )
+        generated_s = time.monotonic() - started
+    finally:
+        stop_process(process)
+    written, total = {}, {}
+    for root in KERNEL_CACHES:
+        for path in Path(root).rglob("*"):
+            if not path.is_file():
+                continue
+            parts = path.relative_to(root).parts
+            key = f"{root}/{parts[0]}" if len(parts) > 1 else root
+            size = path.stat().st_size
+            total[key] = total.get(key, 0) + size
+            if path.stat().st_mtime >= started_at - 1:
+                written[key] = written.get(key, 0) + size
+    if not any(key.startswith("/cache/image/") for key in written) or "/cache/pup/vllm" not in written:
+        raise RuntimeError(
+            f"The build warmup left a kernel cache empty; the engines' cache paths changed: {written}"
+        )
+    report = {
+        "prompt_engine_ready_s": prompt_ready_s,
+        "engine_ready_s": ready_s,
+        "first_picture_s": generated_s,
+        "written_bytes": written,
+        "cache_bytes": total,
+    }
+    build = json.loads(Path("/build.json").read_text())
+    build["kernel_cache"] = report
+    Path("/build.json").write_text(json.dumps(build, indent=2))
+    print("FLUX3_BUILD_KERNELS " + json.dumps(report), flush=True)
 
 
 def create_api(runtime):
@@ -74,11 +343,15 @@ def serving_policy():
     )
 
 
-def prompt_memory_fraction(gpu_name):
-    # Automatic GPU upgrades change capacity; size the prompt engine for the assigned device.
-    for kind, fraction in (("B200", "0.20"), ("H200", "0.25"), ("H100", "0.32")):
+def prompt_memory_budget(gpu_name):
+    """GPU fraction and KV cache bytes for the prompt engine on the assigned device.
+
+    The KV cache is sized explicitly because vLLM's profiler would otherwise count the image engine's
+    concurrent allocations as its own; the fraction still gates vLLM's free-memory check at start.
+    """
+    for kind, fraction, kv_gib in (("B200", "0.20", 16), ("H200", "0.25", 14), ("H100", "0.32", 6)):
         if kind in gpu_name:
-            return fraction
+            return fraction, str(kv_gib << 30)
     raise RuntimeError(f"Unsupported assigned GPU: {gpu_name}")
 
 
@@ -213,6 +486,15 @@ image = (
         secrets=[modal.Secret.from_name("huggingface")],
         timeout=1800,
     )
+    .env(CACHE_ENV)
+    .run_function(
+        compile_kernels,
+        kwargs={"model": MODEL},
+        gpu=GPU,
+        cpu=4,
+        memory=65536,
+        timeout=2400,
+    )
     .add_local_file(ROOT / "flux3_api.py", "/root/flux3_api.py", copy=True)
     .add_local_file(ROOT / "app.py", "/root/app.py", copy=True)
     .env(
@@ -225,11 +507,6 @@ image = (
             "REPLICAS": str(REPLICAS),
             "IDLE_SECONDS": str(IDLE_SECONDS),
             "HIGH_RES": str(int(HIGH_RES)),
-            "HF_HUB_OFFLINE": "1",
-            "SGLANG_CACHE_DIT_ENABLED": "false",
-            "TORCHINDUCTOR_CACHE_DIR": "/cache/image/inductor",
-            "TRITON_CACHE_DIR": "/cache/image/triton",
-            "CUDA_CACHE_PATH": "/cache/image/cuda",
         }
     )
 )
@@ -268,6 +545,13 @@ class Server:
         self.source_task = os.getenv("MODAL_TASK_ID")
         self.prepared_at = time.time()
         self.processes = {}
+        pup_command = prompt_command(assigned_gpu_name())
+        # Both engines boot at once; the prompt engine goes first so its memory check sees the GPU
+        # before the image engine allocates, and its fraction leaves the image engine room.
+        image_command = engine_command(MODEL)
+        self.launch("pup", pup_command, {**os.environ, **PUP_ENV})
+        self.launch("image", image_command, {**os.environ, **ENGINE_ENV})
+        # Tokenizers and prompts load while the engines boot.
         self.tokenizer = AutoTokenizer.from_pretrained("/weights/pup", local_files_only=True)
         self.image_processor = AutoProcessor.from_pretrained(
             Path(CHECKPOINT) / "text_encoder", local_files_only=True
@@ -276,120 +560,19 @@ class Server:
             "text_encoder"
         ]["max_tokens"]
         self.serving_policy = serving_policy()
-        assigned_gpu = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], text=True
-        ).strip()
         self.request_timeout = REQUEST_TIMEOUT
         self.system_prompts = json.loads(Path("/weights/pup/system_prompts.json").read_text())
         self.system_prompt = self.system_prompts["t2i"]
         self.stop_tokens = [self.tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")]
-        cuda = "/opt/pup/lib/python3.12/site-packages/nvidia/cu13"
-        pup_env = {
-            **os.environ,
-            "CUDA_HOME": cuda,
-            "LD_LIBRARY_PATH": f"{cuda}/lib",
-            "VLLM_HOST_IP": "127.0.0.1",
-            "VLLM_USE_FLASHINFER_SAMPLER": "0",
-            "VLLM_USE_DEEP_GEMM": "0",
-            "VLLM_SERVER_DEV_MODE": "1",
-            "TORCHINDUCTOR_CACHE_DIR": "/cache/pup/inductor",
-            "TRITON_CACHE_DIR": "/cache/pup/triton",
-            "CUDA_CACHE_PATH": "/cache/pup/cuda",
-        }
-        pup_command = [
-            "/opt/pup/bin/vllm",
-            "serve",
-            "/weights/pup",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "9002",
-            "--served-model-name",
-            "pup",
-            "--dtype",
-            "bfloat16",
-            "--tensor-parallel-size",
-            "1",
-            "--enable-prefix-caching",
-            "--generation-config",
-            "vllm",
-            "--max-model-len",
-            "8192",
-            "--max-num-seqs",
-            "16",
-            "--gpu-memory-utilization",
-            prompt_memory_fraction(assigned_gpu),
-            "--limit-mm-per-prompt",
-            '{"image":10}',
-            "--attention-config",
-            '{"backend":"TRITON_ATTN"}',
-            "--enable-sleep-mode",
-        ]
-        self.launch("pup", pup_command, pup_env)
         self.wait_for("pup", 9002)
-        image_command = [
-            "sglang",
-            "serve",
-            "--model-path",
-            CHECKPOINT,
-            "--model-variant",
-            "fp8r",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "8001",
-            "--num-gpus",
-            "1",
-            "--attention-backend",
-            "torch_sdpa",
-            "--cpu-offload-components",
-            "none",
-            "--batching-max-size",
-            "1",
-            "--batching-delay-ms",
-            "0",
-            "--output-path",
-            "",
-            "--enable-breakable-cuda-graph",
-            str(MODEL == "distilled").lower(),
-            "--warmup-mode",
-            "server",
-            "--warmup-resolutions",
-            "1024x1024",
-            "--warmup-steps",
-            str(STEPS),
-            "--warmup-sampling-params",
-            json.dumps({"quality": QUALITY, **({"guidance_scale": 3.5} if MODEL == "base" else {})}),
-        ]
-        self.launch("image", image_command, {**os.environ, "SGLANG_FORCE_FUSED_OP_BACKEND": "torch"})
         self.wait_for("image", 8001)
+        caption = expand_once(
+            self.tokenizer, self.system_prompt, "Two blue mugs on a wooden table by a window", 120
+        )
         with httpx.Client(timeout=120) as client:
-            text = self.tokenizer.apply_chat_template(
-                [
-                    {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": "Two blue mugs on a wooden table by a window"},
-                ],
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-            expansion = client.post(
-                "http://127.0.0.1:9002/v1/completions",
-                json={
-                    "model": "pup",
-                    "prompt": self.tokenizer.encode(text, add_special_tokens=False),
-                    **SAMPLING,
-                    "stop_token_ids": self.stop_tokens,
-                },
-            ).raise_for_status()
-            answer = expansion.json()["choices"][0]
-            if answer.get("finish_reason") != "stop" or not answer.get("text", "").strip():
-                raise RuntimeError("Warmup prompt expansion did not complete")
             from flux3_api import prepare_generation, validate_caption_tokens
 
-            prepared = prepare_generation(
-                {"caption": answer["text"].strip(), "seed": 42}, MODEL, self.serving_policy
-            )
+            prepared = prepare_generation({"caption": caption, "seed": 42}, MODEL, self.serving_policy)
             validate_caption_tokens(prepared.text.caption, self.image_processor, self.image_text_max_tokens)
             generated = client.post(
                 "http://127.0.0.1:8001/v1/images/generations",
