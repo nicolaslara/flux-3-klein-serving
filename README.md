@@ -126,7 +126,7 @@ Cold starts, medians:
 | With a snapshot, until the first picture | 33 s | 33 s |
 | Without a snapshot, until the container is ready | 264 s | 460 s |
 
-Distilled with both engines' caches in the image and the engines started together: 264 s to ready and 267 s to the first picture, against 362 to 394 s and 392 to 442 s with only the image engine's caches, and 493 s and 496 s with the engines started one after the other. The prompt upsampler loads its compiled graph in 17 s against 32 to 46 s of compiling and its profiling run takes 0.4 s against 61 to 69 s, so both engines are ready about 2.5 min after the container starts; the warmup picture and the snapshot capture are the rest. Pictures are byte-identical with and without the image engine's caches (10 of 10 at fixed seeds and captions, text to image and edits) and warm throughput is unchanged (0.67 against 0.70 pictures per second at four in flight); the prompt upsampler's compiled graph was not checked for parity. Base was measured without the caches.
+Both engines' kernel caches in the image and the engines starting together take a Distilled fresh start from 493 s to 264 s. The prompt upsampler loads its compiled graph in 17 s instead of compiling for 32 to 46 s, and its profiling run takes 0.4 s instead of 61 to 69 s. Pictures are byte-identical with and without the image engine's caches, and warm throughput is unchanged. Base was measured without the caches.
 
 Other GPUs. These numbers cover the image engine only (captions supplied, so no prompt expansion), 1024x1024, two requests in flight; they compare GPUs rather than describe the full endpoint:
 

@@ -355,6 +355,17 @@ def prompt_memory_budget(gpu_name):
     raise RuntimeError(f"Unsupported assigned GPU: {gpu_name}")
 
 
+def patch_engine_source(path, needle, replacement):
+    """Edit the pinned engine source at one reviewed line, refusing any other version of the file."""
+    source = path.read_text()
+    if source.count(needle) != 1:
+        raise RuntimeError(f"Pinned SGLang source differs from the reviewed version: {path.name}")
+    patched = source.replace(needle, replacement)
+    compile(patched, str(path), "exec")
+    path.write_text(patched)
+    return source, patched
+
+
 def guard_vae(source):
     """Reject quadratic attention above 4MP if the native efficient path is unavailable."""
     expected = "0bb139ea9d377acca6a859121efc24e86f0095a46976cfbd6043deff4a9ceda4"
@@ -436,14 +447,11 @@ def prepare_model(model, high_res=False):
     expected = {*range(multiple, warmup_limit, multiple), warmup_limit}
     if set(captions) != expected:
         raise RuntimeError(f"Incomplete warmup token buckets: {sorted(captions)}")
-    path = source_root / "multimodal_gen/runtime/warmup_request_builder.py"
-    source = path.read_text()
-    needle = "else (DEFAULT_PLACEHOLDER_PROMPT,)"
-    if source.count(needle) != 1:
-        raise RuntimeError("Pinned SGLang warmup source differs from the reviewed version")
-    patched = source.replace(needle, f"else {tuple(captions.values())!r}")
-    compile(patched, str(path), "exec")
-    path.write_text(patched)
+    source, patched = patch_engine_source(
+        source_root / "multimodal_gen/runtime/warmup_request_builder.py",
+        "else (DEFAULT_PLACEHOLDER_PROMPT,)",
+        f"else {tuple(captions.values())!r}",
+    )
     vae_patch_sha256 = None
     if high_res:
         vae_path = source_root / "multimodal_gen/runtime/models/vaes/flux3_image_vae.py"
@@ -535,11 +543,7 @@ app = modal.App(APP_NAME)
 class Server:
     @modal.enter(snap=SNAPSHOT)
     def prepare(self):
-        import base64
-        import io
-
         import httpx
-        from PIL import Image
         from transformers import AutoProcessor, AutoTokenizer
 
         self.source_task = os.getenv("MODAL_TASK_ID")
@@ -569,21 +573,13 @@ class Server:
         caption = expand_once(
             self.tokenizer, self.system_prompt, "Two blue mugs on a wooden table by a window", 120
         )
-        with httpx.Client(timeout=120) as client:
-            from flux3_api import prepare_generation, validate_caption_tokens
+        from flux3_api import prepare_generation, validate_caption_tokens
 
-            prepared = prepare_generation({"caption": caption, "seed": 42}, MODEL, self.serving_policy)
-            validate_caption_tokens(prepared.text.caption, self.image_processor, self.image_text_max_tokens)
-            generated = client.post(
-                "http://127.0.0.1:8001/v1/images/generations",
-                json=prepared.image_parameters(),
-            ).raise_for_status()
-            raw = base64.b64decode(generated.json()["data"][0]["b64_json"], validate=True)
-            with Image.open(io.BytesIO(raw)) as output:
-                if output.size != (1024, 1024) or output.format != "JPEG":
-                    raise RuntimeError("Warmup did not return the expected 1024-square JPEG")
-                output.load()
-            if SNAPSHOT:
+        prepared = prepare_generation({"caption": caption, "seed": 42}, MODEL, self.serving_policy)
+        validate_caption_tokens(prepared.text.caption, self.image_processor, self.image_text_max_tokens)
+        generate_once(prepared.image_parameters(), 120)
+        if SNAPSHOT:
+            with httpx.Client(timeout=120) as client:
                 client.post(
                     "http://127.0.0.1:9002/sleep", params={"level": 1, "mode": "abort"}
                 ).raise_for_status()
